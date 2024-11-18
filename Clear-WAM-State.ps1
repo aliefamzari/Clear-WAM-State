@@ -1,41 +1,61 @@
-# Author : Alif Amzari
-# Purpose : For PRB0001166, KB0017794  - MS-Office apps sign in error due to duplicate Office accounts
-
 # Define the log file path
 $logFilePath = "C:\Windows\Logs\WAM_ClearState.log"
 
-# Function to write logs to the specified log file in CMTrace-compatible format, supporting pipeline input
+# Check if the log file already exists; if it does, clear its contents
+if (Test-Path -Path $logFilePath) {
+    Clear-Content -Path $logFilePath
+} else {
+    "Log file does not exist. It will be created when needed." | Write-Output
+}
+
+# Custom Write-Log function
 function Write-Log {
     [CmdletBinding()]
-    param (
-        [Parameter(ValueFromPipeline = $true)]
-        [string]$message,
-        
-        [string]$logLevel = "INFO"  # Default log level
+    Param(
+        [parameter(Mandatory = $true)]
+        [String]$Path,
+
+        [parameter(Mandatory = $true)]
+        [String]$Message,
+
+        [parameter(Mandatory = $true)]
+        [String]$Component,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Info", "Warning", "Error")]
+        [String]$Type
     )
 
-    # Process pipeline input
-    process {
-        # Append a timestamp and format the message for CMTrace
-        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        $component = "WAM_Clear"
-        $logMessage = "[$timestamp] [$logLevel] [$component] $message"
-        
-        # Write the message to the log file
-        Add-Content -Path $logFilePath -Value $logMessage
+    switch ($Type) {
+        "Info" { [int]$Type = 1 }
+        "Warning" { [int]$Type = 2 }
+        "Error" { [int]$Type = 3 }
     }
+
+    # Create a log entry
+    $Content = "<![LOG[$Message]LOG]!>" + `
+        "<time=`"$(Get-Date -Format "HH:mm:ss.ffffff")`" " + `
+        "date=`"$(Get-Date -Format "M-d-yyyy")`" " + `
+        "component=`"$Component`" " + `
+        "context=`"$([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)`" " + `
+        "type=`"$Type`" " + `
+        "thread=`"$([Threading.Thread]::CurrentThread.ManagedThreadId)`" " + `
+        "file=`"`">"
+
+    # Write the line to the log file
+    Add-Content -Path $Path -Value $Content
 }
 
 # Log the start of the script
-"Starting WAM state clearing process..." | Write-Log
+Write-Log -Path $logFilePath -Message "Starting WAM state clearing process..." -Component "WAM_Clear" -Type "Info"
 
 # Function to get the SID of the logged-in user
 function Get-LoggedInUserSID {
     $currentUser = (Get-WmiObject -Class Win32_Process -Filter "name = 'explorer.exe'").GetOwner().User
-    "Current User: $currentUser" | Write-Output | Write-Log
+    Write-Log -Path $logFilePath -Message "Current User: $currentUser" -Component "WAM_Clear" -Type "Info"
 
     $userSID = (Get-WmiObject Win32_UserAccount -Filter "Name='$currentUser'").SID
-    "User SID: $userSID" | Write-Output | Write-Log
+    Write-Log -Path $logFilePath -Message "User SID: $userSID" -Component "WAM_Clear" -Type "Info"
 
     return $userSID
 }
@@ -43,72 +63,73 @@ function Get-LoggedInUserSID {
 # Get the logged-in user's SID
 $userSID = Get-LoggedInUserSID
 if (-not $userSID) {
-    "Could not retrieve the logged-in user SID. Exiting..." | Write-Log -logLevel "ERROR"
+    Write-Log -Path $logFilePath -Message "Could not retrieve the logged-in user SID. Exiting..." -Component "WAM_Clear" -Type "Error"
     exit
+}
+
+# Get the profile directory of the logged-in user based on their SID
+$userProfilePath = (Get-WmiObject Win32_UserProfile | Where-Object { $_.SID -eq $userSID }).LocalPath
+Write-Log -Path $logFilePath -Message "User Profile Path: $userProfilePath" -Component "WAM_Clear" -Type "Info"
+
+# Construct the LocalAppData path for the logged-in user
+$localAppDataPath = Join-Path $userProfilePath "AppData\Local"
+Write-Log -Path $logFilePath -Message "LocalAppData Path: $localAppDataPath" -Component "WAM_Clear" -Type "Info"
+
+# Define the file paths using the logged-in user's LocalAppData path
+$accountFolderPath = Join-Path $localAppDataPath "Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AC\TokenBroker\Accounts"
+$settingsFilePath = Join-Path $localAppDataPath "Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\Settings\settings.dat"
+
+# Stop the TokenBroker service and set its startup type to Disabled
+Write-Log -Path $logFilePath -Message "Disabling and stopping the TokenBroker service..." -Component "WAM_Clear" -Type "Info"
+Set-Service -Name "TokenBroker" -StartupType Disabled
+Stop-Service -Name "TokenBroker" -Force -PassThru
+
+# Check for the account folder and handle it accordingly
+if (Test-Path -Path $accountFolderPath) {
+    Write-Log -Path $logFilePath -Message "Deleting account files..." -Component "WAM_Clear" -Type "Info"
+    Remove-Item -Path $accountFolderPath\* -Recurse -Force
+} else {
+    Write-Log -Path $logFilePath -Message "Account folder not found. Re-registering Microsoft.AAD.BrokerPlugin app." -Component "WAM_Clear" -Type "Warning"
+    try {
+        $manifestPath = (Get-AppxPackage -Name "Microsoft.AAD.BrokerPlugin").InstallLocation + "\AppxManifest.xml"
+        Add-AppxPackage -Register $manifestPath -DisableDevelopmentMode -ForceApplicationShutdown
+        Write-Log -Path $logFilePath -Message "Microsoft.AAD.BrokerPlugin re-registered successfully." -Component "WAM_Clear" -Type "Info"
+    } catch {
+        Write-Log -Path $logFilePath -Message "Failed to re-register Microsoft.AAD.BrokerPlugin: $_" -Component "WAM_Clear" -Type "Error"
+    }
+}
+
+# Backup and delete the settings.dat file
+if (Test-Path -Path $settingsFilePath) {
+    Write-Log -Path $logFilePath -Message "Backing up and deleting settings.dat..." -Component "WAM_Clear" -Type "Info"
+    Copy-Item -Path $settingsFilePath -Destination "$settingsFilePath.bak" -Force
+    Remove-Item -Path $settingsFilePath -Force
+} else {
+    Write-Log -Path $logFilePath -Message "settings.dat not found. Skipping..." -Component "WAM_Clear" -Type "Warning"
 }
 
 # Registry path in the HKEY_USERS hive
 $registryPath = "Registry::HKEY_USERS\$userSID\Software\Microsoft\IdentityCRL\TokenBroker\DefaultAccount"
 $backupRegistryPath = "Registry::HKEY_USERS\$userSID\Software\Microsoft\IdentityCRL\TokenBroker\DefaultAccount_backup"
 
-# Stop the TokenBroker service and set its startup type to Disabled
-"Disabling and stopping the TokenBroker service..." | Write-Log
-Set-Service -Name "TokenBroker" -StartupType Disabled
-Stop-Service -Name "TokenBroker" -Force -PassThru
-
-# Define the file paths
-$accountFolderPath = "$env:LOCALAPPDATA\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AC\TokenBroker\Accounts"
-$settingsFilePath = "$env:LOCALAPPDATA\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\Settings\settings.dat"
-
-# Check for the account folder and handle it accordingly
-if (Test-Path -Path $accountFolderPath) {
-    "Deleting account files..." | Write-Log
-    Remove-Item -Path $accountFolderPath\* -Recurse -Force
-} else {
-    "Account folder not found. Re-registering Microsoft.AAD.BrokerPlugin app." | Write-Log -logLevel "WARNING"
-    
-    # Retrieve the AppxManifest path and re-register the package
-    try {
-        $manifestPath = (Get-AppxPackage -Name "Microsoft.AAD.BrokerPlugin").InstallLocation + "\AppxManifest.xml"
-        if (Test-Path -Path $manifestPath) {
-            "Re-registering Microsoft.AAD.BrokerPlugin..." | Write-Log
-            Add-AppxPackage -Register $manifestPath -DisableDevelopmentMode -ForceApplicationShutdown
-            "Re-registration of Microsoft.AAD.BrokerPlugin completed successfully." | Write-Log
-        } else {
-            "Manifest file not found at $manifestPath. Re-registration failed." | Write-Log -logLevel "ERROR"
-        }
-    } catch {
-        "Error retrieving Microsoft.AAD.BrokerPlugin package information: $_" | Write-Log -logLevel "ERROR"
-    }
-}
-
-# Backup and delete the settings.dat file
-if (Test-Path -Path $settingsFilePath) {
-    "Backing up and deleting settings.dat..." | Write-Log
-    Copy-Item -Path $settingsFilePath -Destination "$settingsFilePath.bak" -Force
-    Remove-Item -Path $settingsFilePath -Force
-} else {
-    "settings.dat not found. Skipping backup and deletion." | Write-Log -logLevel "WARNING"
-}
-
 # Rename the DefaultAccount registry key for the logged-in user, with error handling if it is already renamed
 if (Test-Path -Path $backupRegistryPath) {
-    "DefaultAccount registry key has already been renamed to DefaultAccount_backup. Skipping renaming step." | Write-Log -logLevel "WARNING"
+    Write-Log -Path $logFilePath -Message "DefaultAccount registry key already renamed to DefaultAccount_backup. Skipping..." -Component "WAM_Clear" -Type "Warning"
 } elseif (Test-Path -Path $registryPath) {
-    "Renaming the DefaultAccount registry key for the logged-in user..." | Write-Log
+    Write-Log -Path $logFilePath -Message "Renaming DefaultAccount registry key..." -Component "WAM_Clear" -Type "Info"
     try {
         Rename-Item -Path $registryPath -NewName $backupRegistryPath.Split('\')[-1]
-        "DefaultAccount registry key successfully renamed to DefaultAccount_backup." | Write-Log
+        Write-Log -Path $logFilePath -Message "DefaultAccount registry key renamed successfully." -Component "WAM_Clear" -Type "Info"
     } catch {
-        "Failed to rename DefaultAccount registry key: $_" | Write-Log -logLevel "ERROR"
+        Write-Log -Path $logFilePath -Message "Failed to rename DefaultAccount registry key: $_" -Component "WAM_Clear" -Type "Error"
     }
 } else {
-    "DefaultAccount registry key not found. Skipping renaming." | Write-Log -logLevel "WARNING"
+    Write-Log -Path $logFilePath -Message "DefaultAccount registry key not found. Skipping..." -Component "WAM_Clear" -Type "Warning"
 }
 
 # Set the TokenBroker service back to Manual startup and restart it
-"Setting the TokenBroker service to Manual startup and restarting it..." | Write-Log
+Write-Log -Path $logFilePath -Message "Setting the TokenBroker service to Manual startup and restarting it..." -Component "WAM_Clear" -Type "Info"
 Set-Service -Name "TokenBroker" -StartupType Manual
 Start-Service -Name "TokenBroker" -PassThru
 
-"WAM state cleared successfully." | Write-Log
+Write-Log -Path $logFilePath -Message "WAM state clearing process completed successfully." -Component "WAM_Clear" -Type "Info"
