@@ -2,7 +2,7 @@
 # Purpose : For PRB0001166, KB0017794  - MS-Office apps sign in error due to duplicate Office accounts
 
 # Define the log file path
-$logFilePath = "C:\Windows\Logs\WAM_ClearLog.txt"
+$logFilePath = "C:\Windows\Logs\WAM_ClearState.log"
 
 # Function to write logs to the specified log file in CMTrace-compatible format, supporting pipeline input
 function Write-Log {
