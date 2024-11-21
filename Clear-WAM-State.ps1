@@ -4,14 +4,16 @@
 # Define the log file path
 $logFilePath = "C:\Windows\Logs\WAM_ClearState.log"
 
+#region Initialize Log File
 # Check if the log file already exists; if it does, clear its contents
 if (Test-Path -Path $logFilePath) {
     Clear-Content -Path $logFilePath
 } else {
     "Log file does not exist. It will be created when needed." | Write-Output
 }
+#endregion
 
-# Custom Write-Log function
+#region Write-Log Function
 function Write-Log {
     [CmdletBinding()]
     Param(
@@ -48,11 +50,9 @@ function Write-Log {
     # Write the line to the log file
     Add-Content -Path $Path -Value $Content
 }
+#endregion
 
-# Log the start of the script
-Write-Log -Path $logFilePath -Message "Starting WAM state clearing process..." -Component "Main" -Type "Info"
-
-# Function to get the SID of the logged-in user
+#region Get Logged-In User SID
 function Get-LoggedInUserSID {
     $currentUser = (Get-WmiObject -Class Win32_Process -Filter "name = 'explorer.exe'").GetOwner().User
     Write-Log -Path $logFilePath -Message "Current User: $currentUser" -Component "Get-LoggedInUserSID" -Type "Info"
@@ -62,77 +62,110 @@ function Get-LoggedInUserSID {
 
     return $userSID
 }
+#endregion
 
+#region Retrieve User Profile and Paths
 # Get the logged-in user's SID
 $userSID = Get-LoggedInUserSID
 if (-not $userSID) {
-    Write-Log -Path $logFilePath -Message "Could not retrieve the logged-in user SID. Exiting..." -Component "Main" -Type "Error"
+    Write-Log -Path $logFilePath -Message "Could not retrieve the logged-in user SID. Exiting..." -Component "Get-LoggedInUserSID" -Type "Error"
     exit
 }
 
 # Get the profile directory of the logged-in user based on their SID
 $userProfilePath = (Get-WmiObject Win32_UserProfile | Where-Object { $_.SID -eq $userSID }).LocalPath
-Write-Log -Path $logFilePath -Message "User Profile Path: $userProfilePath" -Component "Main" -Type "Info"
+Write-Log -Path $logFilePath -Message "User Profile Path: $userProfilePath" -Component "RetrieveUserProfilePath" -Type "Info"
 
 # Construct the LocalAppData path for the logged-in user
 $localAppDataPath = Join-Path $userProfilePath "AppData\Local"
-Write-Log -Path $logFilePath -Message "LocalAppData Path: $localAppDataPath" -Component "Main" -Type "Info"
+Write-Log -Path $logFilePath -Message "LocalAppData Path: $localAppDataPath" -Component "RetrieveUserProfilePath" -Type "Info"
+#endregion
 
-# Define the file paths using the logged-in user's LocalAppData path
-$accountFolderPath = Join-Path $localAppDataPath "Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AC\TokenBroker\Accounts"
-$settingsFilePath = Join-Path $localAppDataPath "Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\Settings\settings.dat"
+#region Registry Modifications
+$registryPath = "HKCU:\Software\Microsoft\IdentityCRL\TokenBroker\DefaultAccount"
+$backupRegistryPath = "HKCU:\Software\Microsoft\IdentityCRL\TokenBroker\DefaultAccount_backup"
 
-# Stop the TokenBroker service and set its startup type to Disabled
-Write-Log -Path $logFilePath -Message "Disabling and stopping the TokenBroker service..." -Component "Service" -Type "Info"
-Set-Service -Name "TokenBroker" -StartupType Disabled
-Stop-Service -Name "TokenBroker" -Force -PassThru
+try {
+    if (Test-Path -Path $registryPath) {
+        Rename-Item -Path $registryPath -NewName $backupRegistryPath -Force
+        Write-Log -Path $logFilePath -Message "Registry key renamed from DefaultAccount to DefaultAccount_backup." -Component "ModifyRegistry" -Type "Info"
+    } else {
+        Write-Log -Path $logFilePath -Message "Registry key DefaultAccount does not exist. Skipping..." -Component "ModifyRegistry" -Type "Warning"
+    }
+} catch {
+    Write-Log -Path $logFilePath -Message "Failed to rename registry key: $_" -Component "ModifyRegistry" -Type "Error"
+}
+#endregion
 
-# Check for the account folder and handle it accordingly
-if (Test-Path -Path $accountFolderPath) {
-    Write-Log -Path $logFilePath -Message "Deleting account files $accountFolderPath\* " -Component "Main" -Type "Info"
-    Remove-Item -Path $accountFolderPath\* -Recurse -Force
+#region BrokerPlugin Cleanup
+# Define paths for the BrokerPlugin directory and Accounts folders
+$brokerPluginPath = Join-Path $localAppDataPath "Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy"
+$accountsFolderPath = Join-Path $brokerPluginPath "AC\TokenBroker\Accounts"
+$accountsOldFolderPath = Join-Path $brokerPluginPath "AC\TokenBroker\Accounts.old"
+
+# Handle Accounts.old folder
+if (Test-Path -Path $accountsOldFolderPath) {
+    Write-Log -Path $logFilePath -Message "Found Accounts.old folder. Deleting..." -Component "CleanupBrokerPlugin" -Type "Warning"
+
+    try {
+        Remove-Item -Path $accountsOldFolderPath -Recurse -Force
+        Write-Log -Path $logFilePath -Message "Deleted Accounts.old folder." -Component "CleanupBrokerPlugin" -Type "Info"
+    } catch {
+        Write-Log -Path $logFilePath -Message "Failed to delete Accounts.old folder: $_" -Component "CleanupBrokerPlugin" -Type "Error"
+    }
+}
+
+# Handle Accounts folder
+if (Test-Path -Path $accountsFolderPath) {
+    Write-Log -Path $logFilePath -Message "Found Accounts folder. Deleting its contents..." -Component "CleanupBrokerPlugin" -Type "Info"
+
+    try {
+        Remove-Item -Path $accountsFolderPath\* -Recurse -Force
+        Write-Log -Path $logFilePath -Message "Deleted contents of Accounts folder." -Component "CleanupBrokerPlugin" -Type "Info"
+    } catch {
+        Write-Log -Path $logFilePath -Message "Failed to delete contents of Accounts folder: $_" -Component "CleanupBrokerPlugin" -Type "Error"
+    }
 } else {
-    Write-Log -Path $logFilePath -Message "Account folder not found. Re-registering Microsoft.AAD.BrokerPlugin app." -Component "AppX" -Type "Warning"
+    Write-Log -Path $logFilePath -Message "Accounts folder not found. Skipping..." -Component "CleanupBrokerPlugin" -Type "Warning"
+}
+
+# Backup and delete settings.dat file
+$settingsFilePath = Join-Path $brokerPluginPath "Settings\settings.dat"
+if (Test-Path -Path $settingsFilePath) {
+    try {
+        Copy-Item -Path $settingsFilePath -Destination "$settingsFilePath.bak" -Force
+        Write-Log -Path $logFilePath -Message "settings.dat backed up successfully." -Component "CleanupBrokerPlugin" -Type "Info"
+        Remove-Item -Path $settingsFilePath -Force
+        Write-Log -Path $logFilePath -Message "settings.dat deleted successfully." -Component "CleanupBrokerPlugin" -Type "Info"
+    } catch {
+        Write-Log -Path $logFilePath -Message "Failed to handle settings.dat: $_" -Component "CleanupBrokerPlugin" -Type "Error"
+    }
+} else {
+    Write-Log -Path $logFilePath -Message "settings.dat not found. Skipping..." -Component "CleanupBrokerPlugin" -Type "Warning"
+}
+#endregion
+
+#region Re-Register BrokerPlugin
+if (-not (Test-Path -Path $brokerPluginPath)) {
+    Write-Log -Path $logFilePath -Message "BrokerPlugin directory not found. Attempting re-registration..." -Component "ReRegisterBrokerPlugin" -Type "Warning"
+
     try {
         $manifestPath = (Get-AppxPackage -Name "Microsoft.AAD.BrokerPlugin").InstallLocation + "\AppxManifest.xml"
         Add-AppxPackage -Register $manifestPath -DisableDevelopmentMode -ForceApplicationShutdown
-        Write-Log -Path $logFilePath -Message "Microsoft.AAD.BrokerPlugin re-registered successfully." -Component "AppX" -Type "Info"
+        Write-Log -Path $logFilePath -Message "Microsoft.AAD.BrokerPlugin re-registered successfully." -Component "ReRegisterBrokerPlugin" -Type "Info"
     } catch {
-        Write-Log -Path $logFilePath -Message "Failed to re-register Microsoft.AAD.BrokerPlugin: $_" -Component "AppX" -Type "Error"
+        Write-Log -Path $logFilePath -Message "Failed to re-register Microsoft.AAD.BrokerPlugin: $_" -Component "ReRegisterBrokerPlugin" -Type "Error"
     }
 }
+#endregion
 
-# Backup and delete the settings.dat file
-if (Test-Path -Path $settingsFilePath) {
-    Write-Log -Path $logFilePath -Message "Backing up and deleting settings.dat..." -Component "Main" -Type "Info"
-    Copy-Item -Path $settingsFilePath -Destination "$settingsFilePath.bak" -Force
-    Remove-Item -Path $settingsFilePath -Force
-} else {
-    Write-Log -Path $logFilePath -Message "settings.dat not found. Skipping..." -Component "Main" -Type "Warning"
-}
-
-# Registry path in the HKEY_USERS hive
-$registryPath = "Registry::HKEY_USERS\$userSID\Software\Microsoft\IdentityCRL\TokenBroker\DefaultAccount"
-$backupRegistryPath = "Registry::HKEY_USERS\$userSID\Software\Microsoft\IdentityCRL\TokenBroker\DefaultAccount_backup"
-
-# Rename the DefaultAccount registry key for the logged-in user, with error handling if it is already renamed
-if (Test-Path -Path $backupRegistryPath) {
-    Write-Log -Path $logFilePath -Message "DefaultAccount registry key already renamed to DefaultAccount_backup. Skipping..." -Component "Registry" -Type "Warning"
-} elseif (Test-Path -Path $registryPath) {
-    Write-Log -Path $logFilePath -Message "Renaming DefaultAccount registry key..." -Component "Registry" -Type "Info"
-    try {
-        Rename-Item -Path $registryPath -NewName $backupRegistryPath.Split('\')[-1]
-        Write-Log -Path $logFilePath -Message "DefaultAccount registry key renamed successfully." -Component "Registry" -Type "Info"
-    } catch {
-        Write-Log -Path $logFilePath -Message "Failed to rename DefaultAccount registry key: $_" -Component "Registry" -Type "Error"
-    }
-} else {
-    Write-Log -Path $logFilePath -Message "DefaultAccount registry key not found. Skipping..." -Component "Registry" -Type "Warning"
-}
-
-# Set the TokenBroker service back to Manual startup and restart it
-Write-Log -Path $logFilePath -Message "Setting the TokenBroker service to Manual startup and restarting it..." -Component "Service" -Type "Info"
+#region Restart TokenBroker Service
+Write-Log -Path $logFilePath -Message "Restarting TokenBroker service..." -Component "TokenBrokerService" -Type "Info"
 Set-Service -Name "TokenBroker" -StartupType Manual
 Start-Service -Name "TokenBroker" -PassThru
+Write-Log -Path $logFilePath -Message "TokenBroker service restarted successfully." -Component "TokenBrokerService" -Type "Info"
+#endregion
 
-Write-Log -Path $logFilePath -Message "WAM state clearing process completed successfully." -Component "Main" -Type "Info"
+#region Completion
+Write-Log -Path $logFilePath -Message "WAM state clearing process completed." -Component "ScriptCompletion" -Type "Info"
+#endregion
